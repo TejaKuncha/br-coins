@@ -9,12 +9,12 @@ from keras.layers import Dense, Conv2D, MaxPooling2D, Flatten, Dropout
 from keras.models import Sequential
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
-from keras.regularizers import l1, l2
+from keras.regularizers import l2
 from keras.utils.np_utils import to_categorical
-from keras.preprocessing.image import ImageDataGenerator
 from keras.optimizers import adam
 from sklearn.model_selection import KFold
 from sklearn.metrics import average_precision_score, roc_auc_score, f1_score, accuracy_score
+from keras.callbacks import ReduceLROnPlateau, CSVLogger
 
 t0 = time()
 warnings.filterwarnings('ignore')
@@ -25,7 +25,7 @@ n = 7  # dummy declaration
 j = 0
 for filename in os.listdir(path):
     img = imread(os.path.join(path, filename))
-    img = resize(img, (48, 64))
+    img = resize(img, (96, 128))
     for i, s in enumerate(filename):
         if s is '_':
             n = int(filename[0:i])
@@ -57,18 +57,13 @@ def classifier_fun():
     clf.add(MaxPooling2D(pool_size=(2, 2)))
     clf.add(Conv2D(64, (3, 3), activation='relu'))
     clf.add(MaxPooling2D(pool_size=(2, 2)))
-    clf.add(Conv2D(128, (3, 3), activation='relu'))
-    clf.add(MaxPooling2D(pool_size=(2, 2)))
     clf.add(Flatten())
-    clf.add(Dense(32, activation='relu', kernel_regularizer=l2(0.01),
-                  bias_initializer='glorot_uniform'))
-    clf.add(Dense(64, activation='relu', kernel_regularizer=l2(0.01),
-                  bias_initializer='glorot_uniform'))
-    clf.add(Dense(128, activation='relu', kernel_regularizer=l2(0.01),
-                  bias_initializer='glorot_uniform'))
-    clf.add(Dense(5, activation='softmax', kernel_regularizer=l2(0.01),
-                  bias_initializer='glorot_uniform'))
-    opt = adam(lr=0.01, decay=0.00001)
+    clf.add(Dense(32, activation='relu', bias_initializer='glorot_uniform', kernel_regularizer=l2(0.01)))
+    clf.add(Dropout(rate=0.15))
+    clf.add(Dense(64, activation='relu', bias_initializer='glorot_uniform', kernel_regularizer=l2(0.01)))
+    clf.add(Dropout(rate=0.15))
+    clf.add(Dense(5, activation='softmax'))
+    opt = adam(lr=0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-8)
     clf.compile(optimizer=opt, loss='categorical_crossentropy',
                 metrics=['categorical_accuracy'])
     clf.summary()
@@ -81,16 +76,11 @@ t3 = time()
 T = t3 - t2
 print('\nTime to load the build the classifier  :  %0.2f sec' % T)
 
-train_image_data_gen = ImageDataGenerator(featurewise_center=True, featurewise_std_normalization=True,
-                                          zca_whitening=True, horizontal_flip=True, vertical_flip=True,
-                                          rotation_range=45, width_shift_range=0.25, height_shift_range=0.25,
-                                          shear_range=0.25, zoom_range=0.25, channel_shift_range=0.25,
-                                          fill_mode='reflect', rescale=1./255)
-test_image_data_gen = ImageDataGenerator(rescale=1./255)
 
+lr = ReduceLROnPlateau(monitor='val_loss', factor=0.9, patience=10,
+                       mode='auto', epsilon=1e-1, cooldown=5, min_lr=1e-6)
+csv = CSVLogger('cross_validation_log.csv', separator=',', append=True)
 fold = KFold(n_splits=5)
-ypredv = np.empty((1, 5))
-ytruev = np.empty((1, 5))
 fscore = []
 accuracy = []
 prs = []
@@ -108,34 +98,21 @@ for train, valid in fold.split(X_train, y_train):
     print('One hot encoded labels')
     ytrain_label = to_categorical(ytrain, 5)
     yvalid_label = to_categorical(yvalid, 5)
-    print('Fit train data to image generator')   # taking too much time
+
+    print('fit the data to classifier')
     t01 = time()
-    train_image_data_gen.fit(Xtrain)
+    model.fit(Xtrain, ytrain_label, epochs=100, batch_size=24,
+              validation_data=(Xvalid, yvalid_label), callbacks=[lr, csv])
     t02 = time()
     t = t02 - t01
-    print('Time taken to fit data to Image gen  :  %0.2f sec' % t)
-    train_set = train_image_data_gen.flow(Xtrain, ytrain_label, batch_size=32)
-    test_set = test_image_data_gen.flow(Xvalid, yvalid_label, batch_size=32)
-    print('fit the data to classifier')
-    t03 = time()
-    model.fit_generator(train_set, steps_per_epoch=len(Xtrain)/32,
-                        validation_data=test_set, validation_steps=len(Xvalid)/32)
-    t04 = time()
-    t = t04 - t03
     print('Time taken to fit data to classifier  :  %0.2f sec' % t)
     print('predict from validation data')
-    y = model.predict_generator(test_set, steps=len(Xvalid)/32)
+    y = model.predict(Xvalid, batch_size=24)
     prs.append(average_precision_score(y_true=yvalid_label, y_score=y, average='weighted'))
     roc.append(roc_auc_score(y_true=yvalid_label, y_score=y, average='weighted'))
-    if c == 1:
-        ytruev = yvalid_label
-        ypredv = y
-    else:
-        ytruev = np.append(ytruev, yvalid_label, axis=0)
-        ypredv = np.append(ypredv, y, axis=0)
     for i in range(len(y)):
         for k in range(len(y[i])):
-            if y[i][k] >= 0.65:
+            if y[i][k] > 0.65:
                 y[i][k] = 1
             else:
                 y[i][k] = 0
@@ -147,18 +124,17 @@ model.save('cnn_model.h5')
 t4 = time()
 T = t4 - t3
 print('\n\n\n\n\nTime to perform the validation  :  %0.2f sec' % T)
-print('\n Total CV Area under PR curve  =  ',
-      average_precision_score(y_true=ytruev, y_score=ypredv, average='weighted'))
-print('Total CV Area under ROC curve  =  ',
-      roc_auc_score(y_true=ytruev, y_score=ypredv, average='weighted'))
+
 print('Mean CV Area under PR curve  =  ', np.mean(prs))
 print('Mean CV Area under ROC curve  =  ', np.mean(roc))
 print('Mean CV f1 score  =  ', np.mean(fscore))
 print('Mean CV Accuracy  =  ', np.mean(accuracy))
+print('\nFit the data to the model')
+y_train_label = to_categorical(y_train, 5)
+model.fit(X_train, y_train_label, epochs=100, batch_size=24, callbacks=[lr])
 print('\n Prediction of Test data')
 ytest_label = to_categorical(y_test, 5)
-yp = model.predict_generator(test_image_data_gen.flow(X_test, y_test, batch_size=32),
-                             steps=len(X_test)/32)
+yp = model.predict(X_test, batch_size=24)
 T = time()-t4
 print('Time for prediction  :  %0.2f sec' % T)
 print('\n Area under PR curve  =  ',
@@ -167,7 +143,7 @@ print('\n Area under ROC curve  =  ',
       roc_auc_score(y_true=ytest_label, y_score=yp, average='weighted'))
 for i in range(len(yp)):
     for k in range(len(yp[i])):
-        if yp[i][k] >= 0.65:
+        if yp[i][k] > 0.65:
             yp[i][k] = 1
         else:
             yp[i][k] = 0
